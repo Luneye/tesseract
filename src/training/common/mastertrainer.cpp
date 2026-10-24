@@ -21,13 +21,13 @@
 #  include "config_auto.h"
 #endif
 
-#include <allheaders.h>
 #include <cmath>
 #include <ctime>
 #include "boxread.h"
 #include "classify.h"
 #include "errorcounter.h"
 #include "featdefs.h"
+#include "image.h"           // for Image
 #include "mastertrainer.h"
 #include "sampleiterator.h"
 #include "shapeclassifier.h"
@@ -587,7 +587,7 @@ CLUSTERER *MasterTrainer::SetupForClustering(
     int shape_id, int *num_samples) {
   int desc_index = ShortNameToFeatureType(feature_defs, kMicroFeatureType);
   int num_params = feature_defs.FeatureDesc[desc_index]->NumParams;
-  ASSERT_HOST(num_params == (int)MicroFeatureParameter::MFCount);
+  ASSERT_HOST(num_params == static_cast<int>(MicroFeatureParameter::MFCount));
   CLUSTERER *clusterer = MakeClusterer(
       num_params, feature_defs.FeatureDesc[desc_index]->ParamDesc);
 
@@ -620,7 +620,8 @@ CLUSTERER *MasterTrainer::SetupForClustering(
 // to the given inttemp_file, and the corresponding pffmtable.
 // The unicharset is the original encoding of graphemes, and shape_set should
 // match the size of the shape_table, and may possibly be totally fake.
-void MasterTrainer::WriteInttempAndPFFMTable(const UNICHARSET &unicharset,
+// Returns false if the templates could not be created or written.
+bool MasterTrainer::WriteInttempAndPFFMTable(const UNICHARSET &unicharset,
                                              const UNICHARSET &shape_set,
                                              const ShapeTable &shape_table,
                                              CLASS_STRUCT *float_classes,
@@ -631,9 +632,16 @@ void MasterTrainer::WriteInttempAndPFFMTable(const UNICHARSET &unicharset,
   fontinfo_table_.MoveTo(&classify->get_fontinfo_table());
   INT_TEMPLATES_STRUCT *int_templates =
       classify->CreateIntTemplates(float_classes, shape_set);
+  if (int_templates == nullptr) {
+    tprintf("Error: failed to create integer templates\n");
+    delete classify;
+    return false;
+  }
+  bool success = true;
   FILE *fp = fopen(inttemp_file, "wb");
   if (fp == nullptr) {
     tprintf("Error, failed to open file \"%s\"\n", inttemp_file);
+    success = false;
   } else {
     classify->WriteIntTemplates(fp, int_templates, shape_set);
     fclose(fp);
@@ -672,6 +680,7 @@ void MasterTrainer::WriteInttempAndPFFMTable(const UNICHARSET &unicharset,
   fp = fopen(pffmtable_file, "wb");
   if (fp == nullptr) {
     tprintf("Error, failed to open file \"%s\"\n", pffmtable_file);
+    success = false;
   } else {
     tesseract::Serialize(fp, shapetable_cutoffs);
     for (size_t c = 0; c < unicharset.size(); ++c) {
@@ -685,6 +694,7 @@ void MasterTrainer::WriteInttempAndPFFMTable(const UNICHARSET &unicharset,
   }
   delete int_templates;
   delete classify;
+  return success;
 }
 
 // Generate debug output relating to the canonical distance between the

@@ -12,13 +12,15 @@
 #include "include_gunit.h"
 
 #include "cycletimer.h" // for CycleTimer
+#include "image.h"      // for Image
 #include "log.h"        // for LOG
 #include "ocrblock.h"   // for class BLOCK
 #include "pageres.h"
+#include "tesseractclass.h" // for Tesseract
 
 #include <tesseract/baseapi.h>
+#include <tesseract/renderer.h>
 
-#include <allheaders.h>
 #include "gmock/gmock-matchers.h"
 
 #include <memory>
@@ -40,6 +42,14 @@ static const char *gt_text[] = {"Hello Google", "\x74\x69\xe1\xba\xbf\x6e\x67",
 
 class FriendlyTessBaseAPI : public tesseract::TessBaseAPI {
   FRIEND_TEST(TesseractTest, LSTMGeometryTest);
+
+public:
+  int FindLines() {
+    return TessBaseAPI::FindLines();
+  }
+  Tesseract *osd_tesseract() const {
+    return osd_tesseract_;
+  }
 };
 
 std::string GetCleanedTextResult(tesseract::TessBaseAPI *tess, Image pix) {
@@ -272,6 +282,46 @@ TEST_F(TesseractTest, LSTMGeometryTest) {
   src_pix.destroy();
 }
 
+// Tests that min_characters_to_try reaches the separate OSD engine, including
+// when the variable changes after that engine has been created.
+TEST_F(TesseractTest, OsdEngineUsesMinCharactersToTry) {
+#ifdef DISABLED_LEGACY_ENGINE
+  // Skip test because the separate OSD engine requires the legacy engine.
+  GTEST_SKIP();
+#else
+  FriendlyTessBaseAPI api;
+  if (api.Init(TessdataPath().c_str(), "eng", tesseract::OEM_LSTM_ONLY) == -1) {
+    // eng.traineddata not found.
+    GTEST_SKIP();
+  }
+  api.SetPageSegMode(tesseract::PSM_AUTO_OSD);
+  ASSERT_TRUE(api.SetVariable("min_characters_to_try", "1"));
+
+  auto pix_deleter = [](Pix *pix) { pixDestroy(&pix); };
+  std::unique_ptr<Pix, decltype(pix_deleter)> src_pix(
+      pixRead(TestDataNameToPath("phototest.tif").c_str()), pix_deleter);
+  ASSERT_TRUE(src_pix != nullptr);
+
+  api.SetImage(src_pix.get());
+  ASSERT_EQ(0, api.FindLines());
+  Tesseract *osd_tess = api.osd_tesseract();
+  if (osd_tess == nullptr) {
+    // osd.traineddata not found.
+    GTEST_SKIP();
+  }
+  // Ensure a separate OSD engine was actually created, so that the value
+  // checks below verify propagation to a distinct engine.
+  ASSERT_NE(osd_tess, api.tesseract());
+  EXPECT_EQ(1, static_cast<int>(osd_tess->min_characters_to_try));
+
+  ASSERT_TRUE(api.SetVariable("min_characters_to_try", "2"));
+  api.SetImage(src_pix.get());
+  ASSERT_EQ(0, api.FindLines());
+  ASSERT_EQ(osd_tess, api.osd_tesseract());
+  EXPECT_EQ(2, static_cast<int>(osd_tess->min_characters_to_try));
+#endif
+}
+
 TEST_F(TesseractTest, InitConfigOnlyTest) {
   // Languages for testing initialization.
   const char *langs[] = {"eng", "chi_tra", "jpn", "vie"};
@@ -393,6 +443,216 @@ TEST(TesseractInstanceTest, TestMultipleTessInstanceVariables) {
     EXPECT_TRUE(api->GetDoubleVariable(double_param_name.c_str(), &doublevar));
     EXPECT_EQ(double_param[i], doublevar);
   }
+}
+
+// Test that PAGE XML output properly closes all Page tags for multi-page documents.
+TEST_F(TesseractTest, PAGEXMLMultiPageClosingTags) {
+  tesseract::TessBaseAPI api;
+  if (api.Init(TessdataPath().c_str(), "eng") == -1) {
+    GTEST_SKIP();
+  }
+  
+  // Simulate two pages by calling GetPAGEText twice
+  Image src_pix = pixRead(TestDataNameToPath("HelloGoogle.tif").c_str());
+  CHECK(src_pix);
+  api.SetInputName("page1.tif");
+  api.SetImage(src_pix);
+  
+  char *page1 = api.GetPAGEText(0);
+  ASSERT_TRUE(page1 != nullptr);
+  
+  // Each page should have exactly one opening and one closing Page tag
+  std::string page1_str(page1);
+  size_t open_count = 0;
+  size_t close_count = 0;
+  size_t pos = 0;
+  
+  // Count opening <Page tags
+  while ((pos = page1_str.find("<Page", pos)) != std::string::npos) {
+    open_count++;
+    pos += 5;
+  }
+  
+  // Count closing </Page> tags
+  pos = 0;
+  while ((pos = page1_str.find("</Page>", pos)) != std::string::npos) {
+    close_count++;
+    pos += 7;
+  }
+  
+  // Each individual page output should have matching Page tags
+  EXPECT_EQ(open_count, 1) << "Each page should have exactly one opening <Page tag";
+  EXPECT_EQ(close_count, 1) << "Each page should have exactly one closing </Page> tag";
+  EXPECT_EQ(open_count, close_count) << "Opening and closing Page tags should match";
+  
+  // Verify the closing tag is present and not part of PcGts
+  EXPECT_THAT(page1_str, HasSubstr("</Page>"));
+  EXPECT_THAT(page1_str, ::testing::Not(HasSubstr("</PcGts>"))) 
+      << "Individual page output should not contain document envelope";
+  
+  delete[] page1;
+  
+  // Test a second page to ensure each page closes properly
+  api.SetInputName("page2.tif");
+  api.SetImage(src_pix);
+  char *page2 = api.GetPAGEText(1);
+  ASSERT_TRUE(page2 != nullptr);
+  
+  std::string page2_str(page2);
+  open_count = 0;
+  close_count = 0;
+  pos = 0;
+  
+  while ((pos = page2_str.find("<Page", pos)) != std::string::npos) {
+    open_count++;
+    pos += 5;
+  }
+  
+  pos = 0;
+  while ((pos = page2_str.find("</Page>", pos)) != std::string::npos) {
+    close_count++;
+    pos += 7;
+  }
+  
+  EXPECT_EQ(open_count, 1) << "Second page should have exactly one opening <Page tag";
+  EXPECT_EQ(close_count, 1) << "Second page should have exactly one closing </Page> tag";
+  
+  delete[] page2;
+  src_pix.destroy();
+}
+
+TEST_F(TesseractTest, PAGEEscapesImageFilename) {
+  tesseract::TessBaseAPI api;
+  if (api.Init(TessdataPath().c_str(), "eng", tesseract::OEM_LSTM_ONLY) == -1) {
+    GTEST_SKIP();
+  }
+
+  Image src_pix = pixRead(TestDataNameToPath("HelloGoogle.tif").c_str());
+  ASSERT_TRUE(src_pix);
+  api.SetInputName("alpha&beta.pgm");
+  api.SetImage(src_pix);
+
+  std::unique_ptr<const char[]> page(api.GetPAGEText(0));
+  ASSERT_TRUE(page != nullptr);
+  EXPECT_THAT(page.get(), HasSubstr("imageFilename=\"alpha&amp;beta.pgm\""));
+
+  src_pix.destroy();
+}
+
+TEST_F(TesseractTest, ALTOEscapesFileName) {
+  file::MakeTmpdir();
+  const std::string output_base = file::JoinPath(FLAGS_test_tmpdir, "alto-escaped-input-name");
+  tesseract::TessBaseAPI api;
+  if (api.Init(TessdataPath().c_str(), "eng", tesseract::OEM_LSTM_ONLY) == -1) {
+    GTEST_SKIP();
+  }
+
+  Image src_pix = pixRead(TestDataNameToPath("HelloGoogle.tif").c_str());
+  ASSERT_TRUE(src_pix);
+  api.SetInputName("alpha&beta.pgm");
+  api.SetImage(src_pix);
+
+  {
+    tesseract::TessAltoRenderer renderer(output_base.c_str());
+    ASSERT_TRUE(renderer.BeginDocument("escaped input name"));
+    ASSERT_TRUE(renderer.AddImage(&api));
+    ASSERT_TRUE(renderer.EndDocument());
+  }
+
+  std::string alto;
+  CHECK_OK(file::GetContents(output_base + ".xml", &alto, file::Defaults()));
+  EXPECT_THAT(alto, HasSubstr("<fileName>alpha&amp;beta.pgm</fileName>"));
+
+  src_pix.destroy();
+}
+
+TEST_F(TesseractTest, PAGERendererEscapesExternalRefAndImageFilename) {
+  file::MakeTmpdir();
+  const std::string output_base = file::JoinPath(FLAGS_test_tmpdir, "page-escaped-input-name");
+  constexpr const char *kInputName = "https://example.test/image?a=1&b=2";
+  tesseract::TessBaseAPI api;
+  if (api.Init(TessdataPath().c_str(), "eng", tesseract::OEM_LSTM_ONLY) == -1) {
+    GTEST_SKIP();
+  }
+
+  Image src_pix = pixRead(TestDataNameToPath("HelloGoogle.tif").c_str());
+  ASSERT_TRUE(src_pix);
+  api.SetInputName(kInputName);
+  api.SetImage(src_pix);
+
+  {
+    tesseract::TessPAGERenderer renderer(output_base.c_str());
+    ASSERT_TRUE(renderer.BeginDocument("escaped input name"));
+    ASSERT_TRUE(renderer.AddImage(&api));
+    ASSERT_TRUE(renderer.EndDocument());
+  }
+
+  std::string page;
+  CHECK_OK(file::GetContents(output_base + ".page.xml", &page, file::Defaults()));
+  EXPECT_THAT(page,
+              HasSubstr("externalRef=\"https://example.test/image?a=1&amp;b=2\""));
+  EXPECT_THAT(page,
+              HasSubstr("imageFilename=\"https://example.test/image?a=1&amp;b=2\""));
+
+  src_pix.destroy();
+}
+
+// Regression test for GHSA-vf7v-2h4f-6f4j: the PAGE XML renderer's
+// AppendLinePolygon previously freed the caller-owned right-to-left polygon
+// accumulator (leaving a dangling pointer in line_top_rtl_pts /
+// line_bottom_rtl_pts). On a line containing at least two right-to-left
+// words, the dangling pointer was read and freed again (use-after-free /
+// double-free), and the stale coordinates were joined into the line polygon,
+// which could trigger a heap-buffer-overflow in RecalcPolygonline.
+// hebrew.png (already in the test data) has several RTL words per line; the
+// CI "heb" model recognises them, so rendering it through GetPAGEText at
+// word level with polygons enabled exercises the RTL branch of
+// AppendLinePolygon. Under AddressSanitizer this call crashes on the
+// unfixed code and is clean on the fixed code.
+TEST_F(TesseractTest, PAGEXMLRightToLeftPolygon) {
+  tesseract::TessBaseAPI api;
+  if (api.Init(TessdataPath().c_str(), "heb") == -1) {
+    GTEST_SKIP() << "heb.traineddata not found";
+  }
+  Image src_pix = pixRead(TestDataNameToPath("hebrew.png").c_str());
+  ASSERT_TRUE(src_pix) << "Could not read hebrew.png";
+  api.SetVariable("page_xml_polygon", "1");
+  // Word level emits a readingDirection attribute per <Word>, which lets us
+  // verify that RTL words were actually recognised (i.e. the buggy code path
+  // was exercised). The double-free/UAF fires at both line and word level.
+  api.SetVariable("page_xml_level", "1");
+  api.SetInputName("hebrew.png");
+  api.SetImage(src_pix);
+  // SetImage clones the image (see ImageThresholder::SetImage), so the local
+  // copy is no longer needed. Release it now rather than at the end so that
+  // every early-return path (GTEST_SKIP / ASSERT) below also frees it and does
+  // not leak the image under LeakSanitizer.
+  src_pix.destroy();
+
+  char *page = api.GetPAGEText(0);
+  ASSERT_TRUE(page != nullptr);
+  std::string page_str(page);
+  delete[] page;
+
+  // Confirm we actually exercised the right-to-left branch: at least one
+  // word must be recognised with RTL reading direction. On the unfixed code,
+  // the GetPAGEText call above already crashes under AddressSanitizer
+  // before reaching this point. If the loaded model does not mark the
+  // recognised characters as right-to-left, the buggy path is not exercised,
+  // so skip rather than fail.
+  size_t rtl_words = 0;
+  size_t pos = 0;
+  while ((pos = page_str.find("readingDirection=\"right-to-left\"", pos)) !=
+         std::string::npos) {
+    rtl_words++;
+    pos += 28;
+  }
+  if (rtl_words == 0) {
+    GTEST_SKIP() << "no right-to-left word recognised; RTL path not exercised";
+  }
+  // A line polygon should have been generated (this is the structure the
+  // dangling pointer corrupted on the unfixed code).
+  EXPECT_THAT(page_str, HasSubstr("<Coords points=\""));
 }
 
 } // namespace tesseract
